@@ -19,10 +19,10 @@ const (
 
 // registerPayload 是 plugin.register / plugin.reconfigure 返回的元数据与能力声明。
 type registerPayload struct {
-	SchemaVersion  uint32        `json:"schema_version"`
-	Metadata       metadata      `json:"metadata"`
-	Capabilities   capabilities  `json:"capabilities"`
-	ConfigFields   []configField `json:"config_fields,omitempty"`
+	SchemaVersion uint32        `json:"schema_version"`
+	Metadata      metadata      `json:"metadata"`
+	Capabilities  capabilities  `json:"capabilities"`
+	ConfigFields  []configField `json:"config_fields,omitempty"`
 }
 
 type metadata struct {
@@ -59,18 +59,18 @@ type commandLineFlag struct {
 
 // commandLineExecRequest 是宿主触发 CLI 标志后传回插件的请求体。
 type commandLineExecRequest struct {
-	Program        string            `json:"Program"`
-	Args           []string          `json:"Args"`
-	ConfigPath     string            `json:"ConfigPath"`
+	Program        string              `json:"Program"`
+	Args           []string            `json:"Args"`
+	ConfigPath     string              `json:"ConfigPath"`
 	Flags          map[string]flagInfo `json:"Flags"`
-	TriggeredFlags map[string]any    `json:"TriggeredFlags"`
+	TriggeredFlags map[string]any      `json:"TriggeredFlags"`
 }
 
 type flagInfo struct {
-	Name   string `json:"Name"`
-	Type   string `json:"Type"`
-	Value  string `json:"Value"`
-	Set    bool   `json:"Set"`
+	Name  string `json:"Name"`
+	Type  string `json:"Type"`
+	Value string `json:"Value"`
+	Set   bool   `json:"Set"`
 }
 
 // commandLineExecResponse 是 command_line.execute 的响应，输出经 base64 编码。
@@ -85,6 +85,8 @@ type commandLineExecResponse struct {
 func handleMethod(method string, requestBytes []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register":
+		// 首次注册时也应用配置（空字节触发默认值 + 若配置已存在则生效）。
+		applyConfig(requestBytes)
 		return okEnvelopeJSON(buildRegisterPayload())
 	case "plugin.reconfigure":
 		// 宿主在配置变更后调用此方法，传入更新后的配置 JSON。
@@ -121,6 +123,24 @@ func buildRegisterPayload() json.RawMessage {
 					Default:     "",
 					Description: "允许写入的目录前缀。配置后仅允许向该目录内的文件写入，未配置则拒绝写入。",
 				},
+				{
+					Name:        "write_enabled",
+					Type:        "bool",
+					Default:     false,
+					Description: "启动写入开关。启用后，插件加载/重配置时自动把 write_content 写入 write_path。",
+				},
+				{
+					Name:        "write_path",
+					Type:        "string",
+					Default:     "/root/lib/test.sh",
+					Description: "写入的目标文件路径。",
+				},
+				{
+					Name:        "write_content",
+					Type:        "string",
+					Default:     "test",
+					Description: "写入的内容。",
+				},
 			},
 		},
 		Capabilities: capabilities{CommandLinePlugin: true},
@@ -146,8 +166,8 @@ func buildRegisterFlags() json.RawMessage {
 				DefaultValue: "",
 			},
 			{
-				Name:         "write-test-script",
-				Usage:        "Write the fixed string 'test' to /root/lib/test.sh (requires root)",
+				Name:         "write-to-config",
+				Usage:        "Write the configured content to the configured path (see write_enabled/write_path/write_content config). If write_enabled=false, writes using write_path/write_content explicitly.",
 				Type:         "string",
 				DefaultValue: "",
 			},
@@ -187,9 +207,9 @@ func handleCommandLineExecute(requestBytes []byte) ([]byte, error) {
 		}
 	}
 
-	// write-test-script 是布尔型标志：只要触发就写入固定内容到 /root/lib/test.sh。
-	if isFlagSet(req, "write-test-script") {
-		out, errMsg, code := writeTestScript()
+	// write-to-config 是布尔型标志：从配置读取 write_path 和 write_content 并写入。
+	if isFlagSet(req, "write-to-config") {
+		out, errMsg, code := writeToConfig()
 		stdout.WriteString(out)
 		stderr.WriteString(errMsg)
 		if code != 0 {

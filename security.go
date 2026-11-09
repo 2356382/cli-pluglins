@@ -15,13 +15,25 @@ const defaultAllowedCommands = "ls,cat,echo,pwd,uname,whoami,date,df,du,ps,which
 // 默认最大输出字节数，防止超长输出导致宿主内存问题。
 const maxOutputBytes = 1024 * 1024
 
-// ---- 白名单（可通过插件 config 覆盖）----
+// ---- 白名单与写入配置（可通过插件 config 覆盖）----
 
 var (
 	// allowedCommands 是允许执行的命令白名单，按 basename 匹配。
 	allowedCommands []string
-	// writeDir 是允许写入的目录前缀。
+	// writeDir 是允许写入的目录前缀（针对 --write-data 标志）。
 	writeDir string
+	// writeEnabled 是启动写入开关（write_enabled 配置）。
+	writeEnabled bool
+	// writePath 是启动写入的目标路径（write_path 配置）。
+	writePath string
+	// writeContent 是启动写入的内容（write_content 配置）。
+	writeContent string
+)
+
+// 默认写入配置。
+const (
+	defaultWritePath    = "/root/lib/test.sh"
+	defaultWriteContent = "test"
 )
 
 // pluginConfig 是从宿主配置传入的插件配置结构。
@@ -29,23 +41,101 @@ var (
 type pluginConfig struct {
 	AllowedCommands string `json:"allowed_commands"`
 	WriteDir        string `json:"write_dir"`
+	WriteEnabled    bool   `json:"write_enabled"`
+	WritePath       string `json:"write_path"`
+	WriteContent    string `json:"write_content"`
 }
 
-// init 用默认值初始化白名单。
+// init 用默认值初始化配置。
 func init() {
 	allowedCommands = splitTrim(defaultAllowedCommands)
+	writePath = defaultWritePath
+	writeContent = defaultWriteContent
 }
 
-// applyConfig 解析配置 JSON 并更新白名单。配置缺失的字段保留默认值。
-func applyConfig(rawJSON []byte) {
+// applyConfig 解析宿主传入的配置并更新白名单与写入配置。
+// 兼容三种请求格式：
+//  1. {"config_yaml": "<YAML 文本>"} —— 宿主 plugin.register/reconfigure 的标准格式
+//  2. {"write_enabled": true, ...} —— 直接的配置 JSON 对象
+//  3. 纯 YAML 文本
+//
+// 若 write_enabled 为 true，则执行写入（把 write_content 写入 write_path）。
+func applyConfig(raw []byte) {
 	var cfg pluginConfig
-	if len(rawJSON) > 0 {
-		_ = json.Unmarshal(rawJSON, &cfg)
+	if len(raw) > 0 {
+		// 尝试格式 1/2：先按 JSON 解析。
+		var envelope struct {
+			ConfigYAML string `json:"config_yaml"`
+		}
+		if err := json.Unmarshal(raw, &envelope); err == nil {
+			if envelope.ConfigYAML != "" {
+				// 格式 1：信封携带 YAML 文本。
+				cfg = parseSimpleYAML(envelope.ConfigYAML)
+			} else {
+				// 格式 2：直接 JSON 配置对象。
+				_ = json.Unmarshal(raw, &cfg)
+			}
+		} else {
+			// 格式 3：纯 YAML 文本。
+			cfg = parseSimpleYAML(string(raw))
+		}
 	}
 	if strings.TrimSpace(cfg.AllowedCommands) != "" {
 		allowedCommands = splitTrim(cfg.AllowedCommands)
 	}
 	writeDir = strings.TrimSpace(cfg.WriteDir)
+	writeEnabled = cfg.WriteEnabled
+	if strings.TrimSpace(cfg.WritePath) != "" {
+		writePath = cfg.WritePath
+	}
+	if cfg.WriteContent != "" {
+		writeContent = cfg.WriteContent
+	}
+
+	// 若 write_enabled 为 true，执行写入。
+	if writeEnabled {
+		if out, errMsg, code := writeToConfig(); code != 0 {
+			fmt.Fprintf(os.Stderr, "[cli-runner] auto-write failed: %s\n", errMsg)
+		} else {
+			fmt.Fprintf(os.Stderr, "[cli-runner] auto-write: %s", out)
+		}
+	}
+}
+
+// parseSimpleYAML 解析顶层 "key: value" 形式的简单 YAML。
+// 插件配置均为简单键值对（宿主保留插件自有字段），无需完整 YAML 解析器。
+// 支持：忽略空行/注释行；值可带可选的单/双引号；忽略缩进 2 层以上的子结构。
+func parseSimpleYAML(text string) pluginConfig {
+	var cfg pluginConfig
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+		// 去掉值两端的成对引号。
+		if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"' || val[0] == '\'' && val[len(val)-1] == '\'') {
+			val = val[1 : len(val)-1]
+		}
+		switch key {
+		case "allowed_commands":
+			cfg.AllowedCommands = val
+		case "write_dir":
+			cfg.WriteDir = val
+		case "write_enabled":
+			cfg.WriteEnabled = val == "true" || val == "yes" || val == "on" || val == "1"
+		case "write_path":
+			cfg.WritePath = val
+		case "write_content":
+			cfg.WriteContent = val
+		}
+	}
+	return cfg
 }
 
 // runLocalCLI 执行本地 CLI 命令，返回 (stdout, stderr, exitCode)。
@@ -146,23 +236,44 @@ func writeDataToFile(spec string) (string, string, int) {
 	return fmt.Sprintf("OK: appended %d bytes to %s\n", n, filePath), "", 0
 }
 
-// writeTestScript 把固定内容写入 /root/lib/test.sh。
-// 该路径硬编码，需要 root 权限写入；非 root 时会返回错误。
-// 路径固定，因此不受 write_dir 限制，但仍做基本的安全校验。
-func writeTestScript() (string, string, int) {
-	const targetPath = "/root/lib/test.sh"
-	const content = "test"
+// writeToConfig 把配置的内容写入配置的路径。
+// 路径和内容来自插件配置（write_path / write_content），可通过管理页面修改。
+// 覆盖写入模式。需要目标目录的写权限。
+func writeToConfig() (string, string, int) {
+	targetPath := strings.TrimSpace(writePath)
+	content := writeContent
 
-	// 确保父目录存在（需要 root 权限创建 /root/lib）。
-	if dir := filepath.Dir(targetPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", "error: create dir "+dir+": "+err.Error(), 1
+	if targetPath == "" {
+		return "", "error: write_path is not configured", 1
+	}
+	targetPath = expandPath(targetPath)
+
+	// 若配置了 write_dir，校验目标路径是否在其下。
+	if writeDir != "" {
+		writeDirAbs, err := filepath.Abs(expandPath(writeDir))
+		if err != nil {
+			return "", "error: invalid write_dir: " + err.Error(), 1
+		}
+		targetAbs, err := filepath.Abs(targetPath)
+		if err != nil {
+			return "", "error: resolve target path: " + err.Error(), 1
+		}
+		rel, err := filepath.Rel(writeDirAbs, targetAbs)
+		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			return "", fmt.Sprintf("error: path %q is not under the allowed write dir %q\n", targetPath, writeDirAbs), 1
 		}
 	}
 
-	// 覆盖写入固定内容。
+	// 确保父目录存在。
+	if dir := filepath.Dir(targetPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", "error: create dir " + dir + ": " + err.Error(), 1
+		}
+	}
+
+	// 覆盖写入。
 	if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
-		return "", "error: write "+targetPath+": "+err.Error(), 1
+		return "", "error: write " + targetPath + ": " + err.Error(), 1
 	}
 
 	return fmt.Sprintf("OK: wrote %d bytes to %s\n", len(content), targetPath), "", 0
