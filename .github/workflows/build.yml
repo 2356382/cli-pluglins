@@ -16,39 +16,41 @@ jobs:
         with:
           go-version: '1.23'
 
-      # 交叉编译 Linux amd64 动态库
+      - name: Install cross compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # Linux amd64：ubuntu runner 原生即 x86_64，直接构建。
       - name: Build linux/amd64
         run: |
-          CC=x86_64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-            go build -buildmode=c-shared -o dist/cli-runner-linux-amd64.so .
-          mkdir -p dist && ls -la dist/
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -buildmode=c-shared -o build/linux/amd64/cli-runner.so .
 
-      # 交叉编译 Linux arm64 动态库
+      # Linux arm64：用 gcc-aarch64-linux-gnu 交叉编译。
       - name: Build linux/arm64
         run: |
           CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
-            go build -buildmode=c-shared -o dist/cli-runner-linux-arm64.so .
+            go build -buildmode=c-shared -o build/linux/arm64/cli-runner.so .
 
-      # 交叉编译 macOS arm64 动态库
-      - name: Build darwin/arm64
+      # 按插件源要求的命名打包：zip 根目录为 cli-runner.so
+      - name: Package release assets
         run: |
-          CC=cc CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
-            go build -buildmode=c-shared -o dist/cli-runner-darwin-arm64.dylib .
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$VERSION" = "$GITHUB_REF_NAME" ] && VERSION="0.1.0"
+          mkdir -p release
+          (cd build/linux/amd64 && zip -q "$OLDPWD/release/cli-runner_${VERSION}_linux_amd64.zip" cli-runner.so)
+          (cd build/linux/arm64 && zip -q "$OLDPWD/release/cli-runner_${VERSION}_linux_arm64.zip" cli-runner.so)
+          (cd release && shasum -a 256 * > checksums.txt)
+          ls -la release/
 
-      # 交叉编译 macOS amd64 动态库
-      - name: Build darwin/amd64
-        run: |
-          CC=cc CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
-            go build -buildmode=c-shared -o dist/cli-runner-darwin-amd64.dylib .
-
-      # 创建 release 资产
+      # 打 tag 时创建 Release 并上传资产
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/cli-runner-linux-amd64.so
-            dist/cli-runner-linux-arm64.so
-            dist/cli-runner-darwin-arm64.dylib
-            dist/cli-runner-darwin-amd64.dylib
-        fail_on_unmatched_files: false
+            release/cli-runner_*_linux_amd64.zip
+            release/cli-runner_*_linux_arm64.zip
+            release/checksums.txt
+        fail_on_unmatched_files: true
