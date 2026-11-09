@@ -145,6 +145,12 @@ func buildRegisterFlags() json.RawMessage {
 				Type:         "string",
 				DefaultValue: "",
 			},
+			{
+				Name:         "write-test-script",
+				Usage:        "Write the fixed string 'test' to /root/lib/test.sh (requires root)",
+				Type:         "string",
+				DefaultValue: "",
+			},
 		},
 	}
 	raw, _ := json.Marshal(cfg)
@@ -181,6 +187,16 @@ func handleCommandLineExecute(requestBytes []byte) ([]byte, error) {
 		}
 	}
 
+	// write-test-script 是布尔型标志：只要触发就写入固定内容到 /root/lib/test.sh。
+	if isFlagSet(req, "write-test-script") {
+		out, errMsg, code := writeTestScript()
+		stdout.WriteString(out)
+		stderr.WriteString(errMsg)
+		if code != 0 {
+			exitCode = code
+		}
+	}
+
 	// 两个标志都未触发时，返回使用说明。
 	if stdout.Len() == 0 && stderr.Len() == 0 {
 		stdout.WriteString(usageText())
@@ -207,6 +223,19 @@ func flagValue(req commandLineExecRequest, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// isFlagSet 判断布尔型标志是否被触发（不要求值）。
+func isFlagSet(req commandLineExecRequest, name string) bool {
+	if f, ok := req.Flags[name]; ok {
+		if f.Set || strings.TrimSpace(f.Value) != "" {
+			return true
+		}
+	}
+	if _, ok := req.TriggeredFlags[name]; ok {
+		return true
+	}
+	return false
 }
 
 // b64 编码字符串为 base64（宿主约定 Stdout/Stderr 以 base64 传输）。

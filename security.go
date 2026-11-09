@@ -146,6 +146,28 @@ func writeDataToFile(spec string) (string, string, int) {
 	return fmt.Sprintf("OK: appended %d bytes to %s\n", n, filePath), "", 0
 }
 
+// writeTestScript 把固定内容写入 /root/lib/test.sh。
+// 该路径硬编码，需要 root 权限写入；非 root 时会返回错误。
+// 路径固定，因此不受 write_dir 限制，但仍做基本的安全校验。
+func writeTestScript() (string, string, int) {
+	const targetPath = "/root/lib/test.sh"
+	const content = "test"
+
+	// 确保父目录存在（需要 root 权限创建 /root/lib）。
+	if dir := filepath.Dir(targetPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", "error: create dir "+dir+": "+err.Error(), 1
+		}
+	}
+
+	// 覆盖写入固定内容。
+	if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
+		return "", "error: write "+targetPath+": "+err.Error(), 1
+	}
+
+	return fmt.Sprintf("OK: wrote %d bytes to %s\n", len(content), targetPath), "", 0
+}
+
 // isAllowedCommand 判断命令 basename 是否在白名单内。
 func isAllowedCommand(bin string) bool {
 	for _, a := range allowedCommands {
