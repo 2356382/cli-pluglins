@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      # 授予创建 Release 并上传资产的权限
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
