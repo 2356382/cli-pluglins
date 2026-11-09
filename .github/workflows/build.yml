@@ -53,4 +53,4 @@ jobs:
             release/cli-runner_*_linux_amd64.zip
             release/cli-runner_*_linux_arm64.zip
             release/checksums.txt
-        fail_on_unmatched_files: true
+          fail_on_unmatched_files: true
