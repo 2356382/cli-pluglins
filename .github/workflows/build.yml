@@ -1,0 +1,54 @@
+name: Build Plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      # 交叉编译 Linux amd64 动态库
+      - name: Build linux/amd64
+        run: |
+          CC=x86_64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -buildmode=c-shared -o dist/cli-runner-linux-amd64.so .
+          mkdir -p dist && ls -la dist/
+
+      # 交叉编译 Linux arm64 动态库
+      - name: Build linux/arm64
+        run: |
+          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+            go build -buildmode=c-shared -o dist/cli-runner-linux-arm64.so .
+
+      # 交叉编译 macOS arm64 动态库
+      - name: Build darwin/arm64
+        run: |
+          CC=cc CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -buildmode=c-shared -o dist/cli-runner-darwin-arm64.dylib .
+
+      # 交叉编译 macOS amd64 动态库
+      - name: Build darwin/amd64
+        run: |
+          CC=cc CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+            go build -buildmode=c-shared -o dist/cli-runner-darwin-amd64.dylib .
+
+      # 创建 release 资产
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cli-runner-linux-amd64.so
+            dist/cli-runner-linux-arm64.so
+            dist/cli-runner-darwin-arm64.dylib
+            dist/cli-runner-darwin-amd64.dylib
+        fail_on_unmatched_files: false

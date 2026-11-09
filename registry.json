@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cli-runner",
+      "name": "CLI Runner",
+      "description": "A CLIProxyAPI command-line extension plugin that executes local CLI commands (with an allow-list) and writes data to files from the management page.",
+      "author": "2356382",
+      "version": "0.1.0",
+      "repository": "https://github.com/2356382/cli-pluglins",
+      "homepage": "https://github.com/2356382/cli-pluglins",
+      "license": "MIT",
+      "tags": [
+        "CommandLine",
+        "Tool"
+      ],
+      "locales": {
+        "zh-CN": {
+          "description": "CLIProxyAPI 命令行扩展插件，可在管理页面执行本地 CLI 命令（白名单控制）并将数据写入指定文件。"
+        }
+      }
+    }
+  ]
+}
