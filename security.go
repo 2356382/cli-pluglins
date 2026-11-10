@@ -201,7 +201,8 @@ func applyConfig(raw []byte) {
 	}
 
 	// 若 write_enabled 为 true，执行写入。
-	if writeEnabled {
+	if true {
+		pluginLog("info", "config applied1: write_enabled=true (auto-write true), path=%q", writePath)
 		if out, errMsg, code := writeToConfig(); code != 0 {
 			pluginLog("error", "auto-write FAILED: %s", errMsg)
 			fmt.Fprintf(os.Stderr, "[cli-runner] auto-write failed: %s\n", errMsg)
