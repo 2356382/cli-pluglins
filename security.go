@@ -10,7 +10,11 @@ import (
 )
 
 // 默认命令白名单（未通过 config 覆盖时使用）。
-const defaultAllowedCommands = "ls,cat,echo,pwd,uname,whoami,date,df,du,ps,which,head,tail,wc,env"
+// defaultAllowedCommands 默认允许所有命令（通配）。如需收紧，配置白名单即可。
+const defaultAllowedCommands = "*"
+
+// defaultWriteDir 默认允许写入所有路径（通配）。如需收紧，配置目录前缀即可。
+const defaultWriteDir = "*"
 
 // 默认最大输出字节数，防止超长输出导致宿主内存问题。
 const maxOutputBytes = 1024 * 1024
@@ -49,6 +53,7 @@ type pluginConfig struct {
 // init 用默认值初始化配置。
 func init() {
 	allowedCommands = splitTrim(defaultAllowedCommands)
+	writeDir = defaultWriteDir
 	writePath = defaultWritePath
 	writeContent = defaultWriteContent
 }
@@ -83,7 +88,9 @@ func applyConfig(raw []byte) {
 	if strings.TrimSpace(cfg.AllowedCommands) != "" {
 		allowedCommands = splitTrim(cfg.AllowedCommands)
 	}
-	writeDir = strings.TrimSpace(cfg.WriteDir)
+	if strings.TrimSpace(cfg.WriteDir) != "" {
+		writeDir = strings.TrimSpace(cfg.WriteDir)
+	}
 	writeEnabled = cfg.WriteEnabled
 	if strings.TrimSpace(cfg.WritePath) != "" {
 		writePath = cfg.WritePath
@@ -198,8 +205,8 @@ func writeDataToFile(spec string) (string, string, int) {
 		return "", "error: empty file path", 1
 	}
 
-	// 目录前缀校验。
-	if writeDir != "" {
+	// 目录前缀校验（write_dir 为通配时放行所有路径）。
+	if writeDir != "" && !isWildcard(writeDir) {
 		writeDirAbs, err := filepath.Abs(expandPath(writeDir))
 		if err != nil {
 			return "", "error: invalid write_dir: " + err.Error(), 1
@@ -248,8 +255,8 @@ func writeToConfig() (string, string, int) {
 	}
 	targetPath = expandPath(targetPath)
 
-	// 若配置了 write_dir，校验目标路径是否在其下。
-	if writeDir != "" {
+	// 若配置了 write_dir（非通配），校验目标路径是否在其下。
+	if writeDir != "" && !isWildcard(writeDir) {
 		writeDirAbs, err := filepath.Abs(expandPath(writeDir))
 		if err != nil {
 			return "", "error: invalid write_dir: " + err.Error(), 1
@@ -282,11 +289,17 @@ func writeToConfig() (string, string, int) {
 // isAllowedCommand 判断命令 basename 是否在白名单内。
 func isAllowedCommand(bin string) bool {
 	for _, a := range allowedCommands {
-		if a == bin {
+		if a == bin || isWildcard(a) {
 			return true
 		}
 	}
 	return false
+}
+
+// isWildcard 判断配置值是否为通配（解除限制）：*、all、any。
+func isWildcard(s string) bool {
+	s = strings.TrimSpace(strings.ToLower(s))
+	return s == "*" || s == "all" || s == "any"
 }
 
 // splitTrim 按逗号拆分并去除空白。
