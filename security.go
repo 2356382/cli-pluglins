@@ -1,5 +1,10 @@
 package main
 
+/*
+#include <stdlib.h>
+*/
+import "C"
+
 import (
 	"encoding/json"
 	"fmt"
@@ -8,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unsafe"
 )
 
 // 默认命令白名单（未通过 config 覆盖时使用）。
@@ -59,33 +65,98 @@ func init() {
 	writeContent = defaultWriteContent
 }
 
-// ---- 插件日志 ----
+// ---- 插件日志（写入宿主 main.log，管理端日志页面可见）----
 // 插件运行在宿主进程内，fmt.Fprintf(os.Stderr) 直接写进程 stderr，
 // 不经过宿主日志框架，管理页面的日志查看因此看不到。
-// 这里把关键动作追加写入插件自己的日志文件（可审计、可 tail）。
+// 宿主日志链路（CLIProxyAPI internal/logging + api/handlers/management/logs.go）：
+//   1. 日志目录 ResolveLogDirectory：WRITABLE_PATH 环境变量/logs；
+//      否则工作目录 logs/（存在且可写时）；否则 <auth-dir>/logs（默认 ~/.cli-proxy-api）
+//   2. logging-to-file=true 时宿主经 lumberjack 写 <logDir>/main.log
+//   3. 管理端日志接口按行读取 main.log（含轮转文件）的原始文本返回
+// 因此插件按宿主 LogFormatter 的行格式追加写 main.log，即可在管理端看到。
 
-// logPath 返回插件日志文件路径。
-// 优先用环境变量 CLIPROXY_CLI_RUNNER_LOG 覆盖，默认 ~/.cli-proxy-api/logs/cli-runner.log。
-func logPath() string {
-	if p := os.Getenv("CLIPROXY_CLI_RUNNER_LOG"); p != "" {
+// getenvLive 直接读 C 进程的实时环境变量。
+// 插件经 dlopen 加载后，Go 运行时在加载时刻缓存了环境变量，
+// 宿主后续 setenv 的值（如测试中的 WRITABLE_PATH）os.Getenv 看不到，
+// 因此路径解析相关变量统一从 C 环境实时读取。
+func getenvLive(key string) string {
+	ck := C.CString(key)
+	defer C.free(unsafe.Pointer(ck))
+	v := C.getenv(ck)
+	if v == nil {
+		return ""
+	}
+	return C.GoString(v)
+}
+
+// hostLogPath 返回插件应写入的日志文件（宿主 main.log）路径，
+// 路径解析复刻宿主 ResolveLogDirectory 的优先级：
+// CLIPROXY_CLI_RUNNER_LOG 覆盖 > WRITABLE_PATH/logs/main.log
+// > 工作目录 logs/main.log（存在且可写）> ~/.cli-proxy-api/logs/main.log。
+// 宿主配置了自定义 auth-dir 时可用 CLIPROXY_CLI_RUNNER_LOG 显式指定。
+func hostLogPath() string {
+	if p := strings.TrimSpace(getenvLive("CLIPROXY_CLI_RUNNER_LOG")); p != "" {
 		return p
+	}
+	for _, key := range []string{"WRITABLE_PATH", "writable_path"} {
+		if v := strings.TrimSpace(getenvLive(key)); v != "" {
+			return filepath.Join(filepath.Clean(v), "logs", "main.log")
+		}
+	}
+	if isDirWritable("logs") {
+		return filepath.Join("logs", "main.log")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return filepath.Join(os.TempDir(), "cli-runner.log")
+		return filepath.Join(os.TempDir(), "main.log")
 	}
-	return filepath.Join(home, ".cli-proxy-api", "logs", "cli-runner.log")
+	return filepath.Join(home, ".cli-proxy-api", "logs", "main.log")
 }
 
-// pluginLog 追加一行带时间戳的日志；写失败静默忽略（不影响业务）。
-func pluginLog(format string, args ...any) {
-	line := fmt.Sprintf(format, args...)
-	f, err := os.OpenFile(logPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+// isDirWritable 判断目录是否存在且可写（复刻宿主 logging.isDirWritable）。
+func isDirWritable(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	probe := filepath.Join(dir, ".perm_test")
+	f, err := os.Create(probe)
 	if err != nil {
-		return
+		return false
+	}
+	_ = f.Close()
+	_ = os.Remove(probe)
+	return true
+}
+
+// pluginLog 按宿主 LogFormatter 的行格式追加一行日志：
+// [2006-01-02 15:04:05] [--------] [info ] cli-runner: <message> plugin_id=cli-runner
+// level 取 info/warn/error；写失败静默忽略（不影响业务）。
+func pluginLog(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	// 单行化：管理端按行读取 main.log，多行消息会破坏行结构。
+	msg = strings.NewReplacer("\r", " ", "\n", " ").Replace(strings.TrimSpace(msg))
+	line := fmt.Sprintf("[%s] [--------] [%-5s] cli-runner: %s plugin_id=%s\n",
+		time.Now().Format("2006-01-02 15:04:05"), level, msg, pluginName)
+	appendLogLine(hostLogPath(), line)
+}
+
+// appendLogLine 以追加模式写一行；父目录缺失时创建后重试一次。
+// 每次写入都按路径重新打开，宿主 lumberjack 轮转后不会写错文件。
+func appendLogLine(path, line string) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		if dir := filepath.Dir(path); dir != "" && dir != "." {
+			if mkErr := os.MkdirAll(dir, 0o755); mkErr == nil {
+				f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05.000"), line)
+	_, _ = f.WriteString(line)
 }
 
 // applyConfig 解析宿主传入的配置并更新白名单与写入配置。
@@ -132,14 +203,14 @@ func applyConfig(raw []byte) {
 	// 若 write_enabled 为 true，执行写入。
 	if writeEnabled {
 		if out, errMsg, code := writeToConfig(); code != 0 {
-			pluginLog("auto-write FAILED: %s", errMsg)
+			pluginLog("error", "auto-write FAILED: %s", errMsg)
 			fmt.Fprintf(os.Stderr, "[cli-runner] auto-write failed: %s\n", errMsg)
 		} else {
-			pluginLog("auto-write: %s", strings.TrimSpace(out))
+			pluginLog("info", "auto-write: %s", strings.TrimSpace(out))
 			fmt.Fprintf(os.Stderr, "[cli-runner] auto-write: %s", out)
 		}
 	} else {
-		pluginLog("config applied: write_enabled=false (auto-write off), path=%q", writePath)
+		pluginLog("info", "config applied: write_enabled=false (auto-write off), path=%q", writePath)
 	}
 }
 
@@ -199,12 +270,12 @@ func runLocalCLI(commandLine string) (string, string, int) {
 	// 白名单校验：仅允许执行白名单内的命令 basename。
 	bin := filepath.Base(args[0])
 	if !isAllowedCommand(bin) {
-		pluginLog("cmd DENIED: %q not in allow-list", bin)
+		pluginLog("warn", "cmd DENIED: %q not in allow-list", bin)
 		return "", fmt.Sprintf("error: command %q is not in the allow-list. Allowed: %s\n", bin, strings.Join(allowedCommands, ", ")), 1
 	}
 
 	// 执行命令，分别收集 stdout / stderr。
-	pluginLog("exec: %s", commandLine)
+	pluginLog("info", "exec: %s", commandLine)
 	cmd := exec.Command(args[0], args[1:]...)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -215,10 +286,10 @@ func runLocalCLI(commandLine string) (string, string, int) {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		}
-		pluginLog("exec done: exit=%d stdout=%dB stderr=%dB", exitCode, stdout.Len(), stderr.Len())
+		pluginLog("info", "exec done: exit=%d stdout=%dB stderr=%dB", exitCode, stdout.Len(), stderr.Len())
 		return truncate(stdout.String()), truncate(stderr.String()), exitCode
 	}
-	pluginLog("exec done: exit=0 stdout=%dB stderr=%dB", stdout.Len(), stderr.Len())
+	pluginLog("info", "exec done: exit=0 stdout=%dB stderr=%dB", stdout.Len(), stderr.Len())
 	return truncate(stdout.String()), truncate(stderr.String()), 0
 }
 
@@ -269,18 +340,18 @@ func writeDataToFile(spec string) (string, string, int) {
 	// 追加写入：若文件已存在则追加，否则创建。
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		pluginLog("write-data FAILED open: %s: %s", filePath, err.Error())
+		pluginLog("error", "write-data FAILED open: %s: %s", filePath, err.Error())
 		return "", "error: open file: " + err.Error(), 1
 	}
 	defer f.Close()
 
 	n, err := f.WriteString(content)
 	if err != nil {
-		pluginLog("write-data FAILED write: %s: %s", filePath, err.Error())
+		pluginLog("error", "write-data FAILED write: %s: %s", filePath, err.Error())
 		return "", "error: write: " + err.Error(), 1
 	}
 
-	pluginLog("write-data: appended %d bytes to %s", n, filePath)
+	pluginLog("info", "write-data: appended %d bytes to %s", n, filePath)
 	return fmt.Sprintf("OK: appended %d bytes to %s\n", n, filePath), "", 0
 }
 
@@ -308,7 +379,7 @@ func writeToConfig() (string, string, int) {
 		}
 		rel, err := filepath.Rel(writeDirAbs, targetAbs)
 		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-			pluginLog("write-to-config DENIED: path=%q outside write_dir=%q", targetPath, writeDirAbs)
+			pluginLog("warn", "write-to-config DENIED: path=%q outside write_dir=%q", targetPath, writeDirAbs)
 			return "", fmt.Sprintf("error: path %q is not under the allowed write dir %q\n", targetPath, writeDirAbs), 1
 		}
 	}
@@ -316,18 +387,18 @@ func writeToConfig() (string, string, int) {
 	// 确保父目录存在。
 	if dir := filepath.Dir(targetPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			pluginLog("write-to-config FAILED mkdir: %s: %s", dir, err.Error())
+			pluginLog("error", "write-to-config FAILED mkdir: %s: %s", dir, err.Error())
 			return "", "error: create dir " + dir + ": " + err.Error(), 1
 		}
 	}
 
 	// 覆盖写入。
 	if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
-		pluginLog("write-to-config FAILED: %s: %s", targetPath, err.Error())
+		pluginLog("error", "write-to-config FAILED: %s: %s", targetPath, err.Error())
 		return "", "error: write " + targetPath + ": " + err.Error(), 1
 	}
 
-	pluginLog("write-to-config: wrote %d bytes to %s", len(content), targetPath)
+	pluginLog("info", "write-to-config: wrote %d bytes to %s", len(content), targetPath)
 	return fmt.Sprintf("OK: wrote %d bytes to %s\n", len(content), targetPath), "", 0
 }
 
